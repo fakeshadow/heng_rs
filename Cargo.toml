@@ -1,0 +1,27 @@
+[package]
+name = "heng_rs"
+version = "0.1.0"
+authors = ["fakeshadow <24548779@qq.com>"]
+edition = "2018"
+keywords = ["scheduler"]
+license = "MIT"
+exclude = ["examples/*"]
+repository = "https://github.com/fakeshadow/heng_rs"
+readme= "README.md"
+
+[lib]
+name = "heng_rs"
+path = "src/lib.rs"
+
+[workspace]
+members = [
+  "examples/basic",
+]
+
+[dependencies]
+futures-preview = "0.3.0-alpha.19"
+tokio-executor = "0.2.0-alpha.6"
+tokio-timer = "0.3.0-alpha.6"
+
+[dev-dependencies]
+tokio = "0.2.0-alpha.6"

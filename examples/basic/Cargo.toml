@@ -1,0 +1,9 @@
+[package]
+name = "heng_rs_example"
+version = "0.1.0"
+authors = ["fakeshadow <24548779@qq.com>"]
+edition = "2018"
+
+[dependencies]
+heng_rs = { path = "../../" }
+tokio = "0.2.0-alpha.6"
