@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["fakeshadow <24548779@qq.com>"]
 edition = "2018"
 keywords = ["scheduler"]
+description = "schedule task runner on tokio-runtime"
 license = "MIT"
 exclude = ["examples/*"]
 repository = "https://github.com/fakeshadow/heng_rs"
@@ -19,7 +20,8 @@ members = [
 ]
 
 [dependencies]
-futures-preview = "0.3.0-alpha.19"
+futures-channel-preview = { version = "0.3.0-alpha.19", features = ["sink"], default-features = false }
+futures-util-preview = { version = "0.3.0-alpha.19", default-features = false }
 tokio-executor = "0.2.0-alpha.6"
 tokio-timer = "0.3.0-alpha.6"
 

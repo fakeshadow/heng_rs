@@ -3,7 +3,7 @@
 //! # example:
 //! ```rust
 //! use std::time::Duration;
-//! use heng_rs::Scheduler;
+//! use heng_rs::{Scheduler, Time, ToDuration};
 //!
 //! struct TestTask(u32);
 //!
@@ -14,8 +14,13 @@
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     let task = TestTask(0);
-//!     // run task with a 1 second interval.
-//!     let addr = task.start(Duration::from_secs(1), |task, ctx| {
+//!     let time = Time::new()
+//!         .every(1.d())
+//!         .plus(2.h())
+//!         .plus(3.m())
+//!         .plus(4.s());
+//!     // run task with a 1 day, 2 hours, 3 minutes and 4 seconds interval.
+//!     let addr = task.start(time, |task, ctx| {
 //!         if let Some(msg) = ctx.get_msg_front() {
 //!             /* do something with message */
 //!         }
@@ -29,7 +34,7 @@
 //!         }
 //!     });
 //!
-//!     // use address to send message to task's context;
+//!     // use address to push message to task's context;
 //!     addr.send(1u32).await;
 //!     Ok(())
 //! }
@@ -42,12 +47,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures::{
-    channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedSender},
-    SinkExt, StreamExt,
-};
+use futures_channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedSender};
+use futures_util::{SinkExt, StreamExt};
+
 // re export futures channel's SendError
-pub use futures::channel::mpsc::SendError;
+pub use futures_channel::mpsc::SendError;
 use tokio_timer::{Interval, Timeout};
 
 pub use time::{Time, ToDuration};
@@ -61,16 +65,24 @@ pub struct SchedulerSender<M> {
     tx_sig: Sender<Signal>,
 }
 
-impl<M: Send> SharedSchedulerSender<M> {
+impl<M: Send + 'static> SharedSchedulerSender<M> {
     pub async fn send(&self, msg: M) -> Result<(), SendError> {
-        let mut inner = self.0.lock().unwrap();
-
-        inner
+        self.0
+            .lock()
+            .unwrap()
             .tx
             .as_mut()
             .expect("SchedulerSender is None")
             .send(msg)
             .await
+    }
+
+    /// send message and ignore the result.
+    pub fn do_send(&self, msg: M) {
+        let sender = self.0.clone();
+        tokio_executor::current_thread::spawn(async move {
+            let _ = sender.lock().unwrap().tx.as_mut().unwrap().send(msg).await;
+        });
     }
 
     pub fn start(&self) -> impl Future<Output = Result<(), SendError>> + '_ {
@@ -319,7 +331,7 @@ mod test_lib {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use futures::{lock::Mutex, SinkExt, StreamExt};
+    use futures_util::{lock::Mutex, SinkExt, StreamExt};
 
     use crate::time::{Time, ToDuration};
     use crate::Scheduler;
@@ -334,7 +346,7 @@ mod test_lib {
     async fn stop_send_restart() -> std::io::Result<()> {
         let test = TestSchedule;
 
-        let (tx, mut rx) = futures::channel::mpsc::channel::<u32>(1);
+        let (tx, mut rx) = futures_channel::mpsc::channel::<u32>(1);
         let tx = Arc::new(Mutex::new(tx));
 
         let time = Time::new().every(400.millis()).plus(100.millis());
