@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use heng_rs::{Scheduler, SendError, Time, ToDuration};
-use std::pin::Pin;
 use tokio::timer::delay;
 
 // setup a new schedule
@@ -25,7 +24,7 @@ async fn main() -> std::io::Result<()> {
     // start scheduler will return it's address.
     let addr = test
         // pass Time/Duration and a closure where you run the schedule and access the task self and context.
-        .start(time, move |task, ctx| {
+        .start(time, move |_task, ctx| {
             let new = Instant::now();
             println!("{:#?} have passed since last run", new.duration_since(now));
             now = new;

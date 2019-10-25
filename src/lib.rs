@@ -48,17 +48,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedSender};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{lock::Mutex as FutMutex, SinkExt, StreamExt};
 
 // re export futures channel's SendError
 pub use futures_channel::mpsc::SendError;
-use tokio_timer::{Interval, Timeout};
+use tokio_timer::Interval;
 
 pub use time::{Time, ToDuration};
 
 mod time;
 
-pub struct SharedSchedulerSender<M>(Arc<Mutex<SchedulerSender<M>>>);
+pub struct SharedSchedulerSender<M>(Arc<FutMutex<SchedulerSender<M>>>);
+
+impl<M> Clone for SharedSchedulerSender<M> {
+    fn clone(&self) -> Self {
+        SharedSchedulerSender(self.0.clone())
+    }
+}
 
 pub struct SchedulerSender<M> {
     tx: Option<UnboundedSender<M>>,
@@ -69,7 +75,7 @@ impl<M: Send + 'static> SharedSchedulerSender<M> {
     pub async fn send(&self, msg: M) -> Result<(), SendError> {
         self.0
             .lock()
-            .unwrap()
+            .await
             .tx
             .as_mut()
             .expect("SchedulerSender is None")
@@ -80,8 +86,8 @@ impl<M: Send + 'static> SharedSchedulerSender<M> {
     /// send message and ignore the result.
     pub fn do_send(&self, msg: M) {
         let sender = self.0.clone();
-        tokio_executor::current_thread::spawn(async move {
-            let _ = sender.lock().unwrap().tx.as_mut().unwrap().send(msg).await;
+        tokio_executor::spawn(async move {
+            let _ = sender.lock().await.tx.as_mut().unwrap().send(msg).await;
         });
     }
 
@@ -101,9 +107,7 @@ impl<M: Send + 'static> SharedSchedulerSender<M> {
     }
 
     async fn send_signal(&self, signal: Signal) -> Result<(), SendError> {
-        let mut inner = self.0.lock().unwrap();
-
-        inner.tx_sig.send(signal).await
+        self.0.lock().await.tx_sig.send(signal).await
     }
 }
 
@@ -132,7 +136,7 @@ pub trait Scheduler: Sized + Send + 'static {
         self.run(f, ctx);
 
         // return shared channel sender.
-        SharedSchedulerSender(Arc::new(Mutex::new(SchedulerSender { tx, tx_sig })))
+        SharedSchedulerSender(Arc::new(FutMutex::new(SchedulerSender { tx, tx_sig })))
     }
 
     fn run<F, Fut, R>(mut self, mut f: F, mut ctx: Context<Self>)
@@ -211,7 +215,7 @@ pub trait Scheduler: Sized + Send + 'static {
 
         self.run_with_handler(ctx);
 
-        SharedSchedulerSender(Arc::new(Mutex::new(SchedulerSender { tx, tx_sig })))
+        SharedSchedulerSender(Arc::new(FutMutex::new(SchedulerSender { tx, tx_sig })))
     }
 
     fn run_with_handler(mut self, mut ctx: Context<Self>) {
@@ -312,9 +316,17 @@ impl<S: Scheduler> Context<S> {
         self.lock().pop_back()
     }
 
+    pub fn push_msg_back(&self, msg: S::Message) {
+        self.lock().push_back(msg)
+    }
+
+    pub fn push_msg_front(&self, msg: S::Message) {
+        self.lock().push_front(msg)
+    }
+
     async fn should_restart(&mut self, dur: Duration) -> bool {
         // we listen to signal for a period of self duration after handle
-        if let Ok(signal) = Timeout::new(self.rx_sig.next(), dur).await {
+        if let Ok(signal) = self.rx_sig.try_next() {
             if let Some(signal) = signal {
                 // if we have a changed duration we drop the interval and start a new run.
                 if self.signal(signal).dur != dur {
