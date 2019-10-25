@@ -47,37 +47,35 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures_channel::mpsc::{channel, unbounded, Receiver, Sender, UnboundedSender};
-use futures_util::{lock::Mutex as FutMutex, SinkExt, StreamExt};
+use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures_util::{SinkExt, StreamExt};
 
 // re export futures channel's SendError
 pub use futures_channel::mpsc::SendError;
-use tokio_timer::Interval;
+use tokio_timer::{Interval, Timeout};
 
 pub use time::{Time, ToDuration};
 
 mod time;
 
-pub struct SharedSchedulerSender<M>(Arc<FutMutex<SchedulerSender<M>>>);
+pub struct SchedulerSender<M> {
+    tx: Option<UnboundedSender<M>>,
+    tx_sig: Option<UnboundedSender<Signal>>,
+}
 
-impl<M> Clone for SharedSchedulerSender<M> {
+impl<M> Clone for SchedulerSender<M> {
     fn clone(&self) -> Self {
-        SharedSchedulerSender(self.0.clone())
+        SchedulerSender {
+            tx: self.tx.as_ref().cloned(),
+            tx_sig: self.tx_sig.as_ref().cloned(),
+        }
     }
 }
 
-pub struct SchedulerSender<M> {
-    tx: Option<UnboundedSender<M>>,
-    tx_sig: Sender<Signal>,
-}
-
-impl<M: Send + 'static> SharedSchedulerSender<M> {
+impl<M: Send + 'static> SchedulerSender<M> {
     pub async fn send(&self, msg: M) -> Result<(), SendError> {
-        self.0
-            .lock()
-            .await
-            .tx
-            .as_mut()
+        self.tx
+            .as_ref()
             .expect("SchedulerSender is None")
             .send(msg)
             .await
@@ -85,9 +83,9 @@ impl<M: Send + 'static> SharedSchedulerSender<M> {
 
     /// send message and ignore the result.
     pub fn do_send(&self, msg: M) {
-        let sender = self.0.clone();
+        let sender = self.clone();
         tokio_executor::spawn(async move {
-            let _ = sender.lock().await.tx.as_mut().unwrap().send(msg).await;
+            let _ = sender.tx.as_ref().unwrap().send(msg).await;
         });
     }
 
@@ -107,18 +105,18 @@ impl<M: Send + 'static> SharedSchedulerSender<M> {
     }
 
     async fn send_signal(&self, signal: Signal) -> Result<(), SendError> {
-        self.0.lock().await.tx_sig.send(signal).await
+        self.tx_sig
+            .as_ref()
+            .expect("SignalSender is None")
+            .send(signal)
+            .await
     }
 }
 
 pub trait Scheduler: Sized + Send + 'static {
     type Message: Send;
 
-    fn start<F, Fut, R>(
-        self,
-        time: impl Into<Duration>,
-        f: F,
-    ) -> SharedSchedulerSender<Self::Message>
+    fn start<F, Fut, R>(self, time: impl Into<Duration>, f: F) -> SchedulerSender<Self::Message>
     where
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
@@ -136,7 +134,10 @@ pub trait Scheduler: Sized + Send + 'static {
         self.run(f, ctx);
 
         // return shared channel sender.
-        SharedSchedulerSender(Arc::new(FutMutex::new(SchedulerSender { tx, tx_sig })))
+        SchedulerSender {
+            tx,
+            tx_sig: Some(tx_sig),
+        }
     }
 
     fn run<F, Fut, R>(mut self, mut f: F, mut ctx: Context<Self>)
@@ -206,7 +207,7 @@ pub trait Scheduler: Sized + Send + 'static {
     ///     Ok(())
     /// }
     ///```
-    fn start_with_handler(self, time: impl Into<Duration>) -> SharedSchedulerSender<Self::Message> {
+    fn start_with_handler(self, time: impl Into<Duration>) -> SchedulerSender<Self::Message> {
         let (mut ctx, tx_sig) = Context::new();
 
         let tx = spawn_message_channel::<Self>(&ctx.msg);
@@ -215,7 +216,10 @@ pub trait Scheduler: Sized + Send + 'static {
 
         self.run_with_handler(ctx);
 
-        SharedSchedulerSender(Arc::new(FutMutex::new(SchedulerSender { tx, tx_sig })))
+        SchedulerSender {
+            tx,
+            tx_sig: Some(tx_sig),
+        }
     }
 
     fn run_with_handler(mut self, mut ctx: Context<Self>) {
@@ -277,12 +281,12 @@ pub struct Context<S: Scheduler> {
     msg: Arc<Mutex<VecDeque<S::Message>>>,
     dur: Duration,
     running: bool,
-    rx_sig: Receiver<Signal>,
+    rx_sig: UnboundedReceiver<Signal>,
 }
 
 impl<S: Scheduler> Context<S> {
-    fn new() -> (Self, Sender<Signal>) {
-        let (tx, rx_sig) = channel::<Signal>(1);
+    fn new() -> (Self, UnboundedSender<Signal>) {
+        let (tx, rx_sig) = unbounded::<Signal>();
         let ctx = Context {
             msg: Arc::new(Mutex::new(VecDeque::new())),
             dur: Duration::default(),
@@ -326,7 +330,7 @@ impl<S: Scheduler> Context<S> {
 
     async fn should_restart(&mut self, dur: Duration) -> bool {
         // we listen to signal for a period of self duration after handle
-        if let Ok(signal) = self.rx_sig.try_next() {
+        if let Ok(signal) = Timeout::new(self.rx_sig.next(), dur).await {
             if let Some(signal) = signal {
                 // if we have a changed duration we drop the interval and start a new run.
                 if self.signal(signal).dur != dur {
