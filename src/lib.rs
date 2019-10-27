@@ -35,7 +35,7 @@
 //!     });
 //!
 //!     // use address to push message to task's context;
-//!     addr.send(1u32).await;
+//!     addr.send(1).await;
 //!     Ok(())
 //! }
 //! ```
@@ -73,6 +73,9 @@ impl<M> Clone for SchedulerSender<M> {
 }
 
 impl<M: Send + 'static> SchedulerSender<M> {
+    /// send message to `Scheduler`'s `Context`.
+    ///
+    /// `Context` stores the message in a `VecDequeue`.New message is pushed to the back.
     pub async fn send(&self, msg: M) -> Result<(), SendError> {
         self.tx
             .as_ref()
@@ -81,7 +84,7 @@ impl<M: Send + 'static> SchedulerSender<M> {
             .await
     }
 
-    /// send message and ignore the result.
+    /// send message to `Scheduler`'s `Context` and ignore the result.
     pub fn do_send(&self, msg: M) {
         let sender = self.clone();
         tokio_executor::spawn(async move {
@@ -97,6 +100,7 @@ impl<M: Send + 'static> SchedulerSender<M> {
         self.send_signal(Signal::Stop)
     }
 
+    /// change the interval of `Scheduler`.
     pub fn change_time(
         &self,
         time: impl Into<Duration>,
@@ -116,6 +120,9 @@ impl<M: Send + 'static> SchedulerSender<M> {
 pub trait Scheduler: Sized + Send + 'static {
     type Message: Send;
 
+    /// start a new `Scheduler` with the given time and closure.
+    ///
+    /// You can't get access of `&mut Self` and `&mut Context` in the closure with a future or async block.
     fn start<F, Fut, R>(self, time: impl Into<Duration>, f: F) -> SchedulerSender<Self::Message>
     where
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
@@ -134,10 +141,7 @@ pub trait Scheduler: Sized + Send + 'static {
         self.run(f, ctx);
 
         // return shared channel sender.
-        SchedulerSender {
-            tx,
-            tx_sig: Some(tx_sig),
-        }
+        SchedulerSender { tx, tx_sig }
     }
 
     fn run<F, Fut, R>(mut self, mut f: F, mut ctx: Context<Self>)
@@ -187,12 +191,12 @@ pub trait Scheduler: Sized + Send + 'static {
     ///
     ///     fn handler<'a>(&'a mut self, ctx: &'a mut Context<Self>) -> Pin<Box<dyn Future<Output=()> + Send + 'a>> {
     ///         Box::pin(async move {
-    ///             assert_eq!(self.field, 0u32);
+    ///             assert_eq!(self.field, 0);
     ///             // we can modify the context and self in the async block.
     ///             if let Some(msg) = ctx.get_msg_front() {
     ///                 self.field = msg;
     ///             };
-    ///             assert_eq!(self.field, 3u32);
+    ///             assert_eq!(self.field, 3);
     ///         })
     ///     }
     /// }
@@ -202,7 +206,7 @@ pub trait Scheduler: Sized + Send + 'static {
     ///     let addr = task.start_with_handler(Duration::from_secs(1));
     ///
     ///     // use address to send message to task;
-    ///     addr.send(3u32).await;
+    ///     addr.send(3).await;
     ///     tokio::timer::delay(Instant::now() + Duration::from_secs(2)).await;
     ///     Ok(())
     /// }
@@ -216,10 +220,7 @@ pub trait Scheduler: Sized + Send + 'static {
 
         self.run_with_handler(ctx);
 
-        SchedulerSender {
-            tx,
-            tx_sig: Some(tx_sig),
-        }
+        SchedulerSender { tx, tx_sig }
     }
 
     fn run_with_handler(mut self, mut ctx: Context<Self>) {
@@ -227,12 +228,12 @@ pub trait Scheduler: Sized + Send + 'static {
             let dur = ctx.dur;
             let mut interval = Interval::new(Instant::now(), dur);
             while let Some(_instant) = interval.next().await {
-                // if we are not running we just ignore F.
+                // if we are not running we just ignore handler.
                 if ctx.running {
                     self.handler(&mut ctx).await;
                 }
 
-                // we listen to signal for a period of self duration after handle
+                // we listen to signal for a period of self duration after handler
                 if ctx.should_restart(dur).await {
                     drop(interval);
                     return self.run_with_handler(ctx);
@@ -257,13 +258,13 @@ fn spawn_message_channel<S: Scheduler>(
         let msg = Arc::downgrade(&msg);
         tokio_executor::spawn(async move {
             while let Some(m) = rx.next().await {
-                if let Some(msg) = msg.upgrade() {
-                    msg.lock()
+                match msg.upgrade() {
+                    Some(msg) => msg
+                        .lock()
                         .expect("Failed to acquire Message Mutex lock")
-                        .push_back(m);
-                } else {
-                    panic!("Fail to upgrade Arc<Mutex<VecDequeue<Scheduler::Message>. It's likely the Scheduler has already been dropped");
-                }
+                        .push_back(m),
+                    None => panic!("Fail to upgrade Arc<Mutex<VecDequeue<Scheduler::Message>"),
+                };
             }
         });
 
@@ -285,7 +286,7 @@ pub struct Context<S: Scheduler> {
 }
 
 impl<S: Scheduler> Context<S> {
-    fn new() -> (Self, UnboundedSender<Signal>) {
+    fn new() -> (Self, Option<UnboundedSender<Signal>>) {
         let (tx, rx_sig) = unbounded::<Signal>();
         let ctx = Context {
             msg: Arc::new(Mutex::new(VecDeque::new())),
@@ -294,7 +295,7 @@ impl<S: Scheduler> Context<S> {
             rx_sig,
         };
 
-        (ctx, tx)
+        (ctx, Some(tx))
     }
 
     fn signal(&mut self, signal: Signal) -> &mut Self {
@@ -310,6 +311,15 @@ impl<S: Scheduler> Context<S> {
         self.msg
             .lock()
             .expect("Failed to acquire Message Mutex lock")
+    }
+
+    /// Access the message queue with a closure.
+    pub fn get_queue_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut VecDeque<S::Message>) -> R,
+    {
+        let mut guard = self.lock();
+        f(&mut guard)
     }
 
     pub fn get_msg_front(&self) -> Option<S::Message> {
@@ -373,13 +383,12 @@ mod test_lib {
             async move {
                 if let Some(msg) = msg {
                     let _ = sender.lock().await.send(msg).await;
-                }
-                Ok::<(), ()>(())
+                };
             }
         });
 
         let _ = addr.stop().await;
-        let _ = addr.send(32u32).await;
+        let _ = addr.send(32).await;
 
         let now = Instant::now();
 
@@ -387,8 +396,34 @@ mod test_lib {
 
         let _ = addr.start().await;
 
-        assert_eq!(rx.next().await.unwrap(), 32u32);
+        assert_eq!(rx.next().await.unwrap(), 32);
         assert!(Instant::now().duration_since(now) > Duration::from_secs(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue() -> std::io::Result<()> {
+        let test = TestSchedule;
+
+        let time = Time::new().every(1.s());
+
+        let addr = test.start(time, |_task, ctx| {
+            assert_eq!(ctx.get_queue_mut(|queue| queue.pop_front()), Some(1));
+            assert_eq!(ctx.get_msg_front(), Some(2));
+            assert_eq!(ctx.get_msg_back(), Some(3));
+            assert_eq!(ctx.get_queue_mut(|queue| queue.get(0) == Some(&4)), true);
+            futures_util::future::ready(())
+        });
+
+        let _ = addr.stop().await;
+        let _ = addr.send(1).await;
+        let _ = addr.send(2).await;
+        let _ = addr.send(4).await;
+        let _ = addr.send(3).await;
+        let _ = addr.start().await;
+
+        tokio::timer::delay(Instant::now() + Duration::from_secs(2)).await;
 
         Ok(())
     }
