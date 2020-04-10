@@ -19,11 +19,20 @@ members = [
   "examples/basic",
 ]
 
-[dependencies]
-futures-channel-preview = { version = "0.3.0-alpha.19", features = ["sink"], default-features = false }
-futures-util-preview = { version = "0.3.0-alpha.19", default-features = false }
-tokio-executor = "0.2.0-alpha.6"
-tokio-timer = "0.3.0-alpha.6"
+[dependencies.futures-channel]
+version = "0.3.4"
+features = ["sink"]
+
+[dependencies.futures-util]
+version = "0.3.4"
+features = ["sink"]
+default-features = false
+
+[dependencies.tokio]
+version = "0.2.16"
+default-features = false
+features = [ "rt-core", "time" ]
 
 [dev-dependencies]
-tokio = "0.2.0-alpha.6"
+tokio = { version = "0.2.16", default-features = false, features = [ "macros" ] }
+futures-util = { version = "0.3.4" }

@@ -45,14 +45,14 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::{SinkExt, StreamExt};
 
 // re export futures channel's SendError
 pub use futures_channel::mpsc::SendError;
-use tokio_timer::{Interval, Timeout};
+use tokio::time::{interval, timeout};
 
 pub use time::{Time, ToDuration};
 
@@ -87,7 +87,7 @@ impl<M: Send + 'static> SchedulerSender<M> {
     /// send message to `Scheduler`'s `Context` and ignore the result.
     pub fn do_send(&self, msg: M) {
         let sender = self.clone();
-        tokio_executor::spawn(async move {
+        tokio::spawn(async move {
             let _ = sender.tx.as_ref().unwrap().send(msg).await;
         });
     }
@@ -149,20 +149,22 @@ pub trait Scheduler: Sized + Send + 'static {
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
     {
-        tokio_executor::spawn(async move {
+        tokio::spawn(async move {
             let dur = ctx.dur;
-            let mut interval = Interval::new(Instant::now(), dur);
-            while let Some(_instant) = interval.next().await {
+            let mut interval = interval(dur);
+            loop {
+                interval.tick().await;
                 // if we are not running we just ignore F.
                 if ctx.running {
                     f(&mut self, &mut ctx).await;
                 }
 
                 if ctx.should_restart(dur).await {
-                    drop(interval);
-                    return self.run(f, ctx);
+                    break;
                 }
             }
+            drop(interval);
+            return self.run(f, ctx);
         });
     }
 
@@ -207,7 +209,7 @@ pub trait Scheduler: Sized + Send + 'static {
     ///
     ///     // use address to send message to task;
     ///     addr.send(3).await;
-    ///     tokio::timer::delay(Instant::now() + Duration::from_secs(2)).await;
+    ///     tokio::time::delay_for(Duration::from_secs(2)).await;
     ///     Ok(())
     /// }
     ///```
@@ -224,10 +226,11 @@ pub trait Scheduler: Sized + Send + 'static {
     }
 
     fn run_with_handler(mut self, mut ctx: Context<Self>) {
-        tokio_executor::spawn(async move {
+        tokio::spawn(async move {
             let dur = ctx.dur;
-            let mut interval = Interval::new(Instant::now(), dur);
-            while let Some(_instant) = interval.next().await {
+            let mut interval = interval(dur);
+            loop {
+                interval.tick().await;
                 // if we are not running we just ignore handler.
                 if ctx.running {
                     self.handler(&mut ctx).await;
@@ -235,10 +238,11 @@ pub trait Scheduler: Sized + Send + 'static {
 
                 // we listen to signal for a period of self duration after handler
                 if ctx.should_restart(dur).await {
-                    drop(interval);
-                    return self.run_with_handler(ctx);
+                    break;
                 }
             }
+            drop(interval);
+            return self.run_with_handler(ctx);
         });
     }
 }
@@ -256,7 +260,7 @@ fn spawn_message_channel<S: Scheduler>(
 
         // spawn a future to inject message to context.msg with channel sender.
         let msg = Arc::downgrade(&msg);
-        tokio_executor::spawn(async move {
+        tokio::spawn(async move {
             while let Some(m) = rx.next().await {
                 match msg.upgrade() {
                     Some(msg) => msg
@@ -340,7 +344,7 @@ impl<S: Scheduler> Context<S> {
 
     async fn should_restart(&mut self, dur: Duration) -> bool {
         // we listen to signal for a period of self duration after handle
-        if let Ok(signal) = Timeout::new(self.rx_sig.next(), dur).await {
+        if let Ok(signal) = timeout(dur, self.rx_sig.next()).await {
             if let Some(signal) = signal {
                 // if we have a changed duration we drop the interval and start a new run.
                 if self.signal(signal).dur != dur {
@@ -358,6 +362,7 @@ mod test_lib {
     use std::time::{Duration, Instant};
 
     use futures_util::{lock::Mutex, SinkExt, StreamExt};
+    use tokio::time::delay_for;
 
     use crate::time::{Time, ToDuration};
     use crate::Scheduler;
@@ -392,7 +397,7 @@ mod test_lib {
 
         let now = Instant::now();
 
-        tokio::timer::delay(Instant::now() + Duration::from_secs(2)).await;
+        delay_for(Duration::from_secs(2)).await;
 
         let _ = addr.start().await;
 
@@ -423,7 +428,7 @@ mod test_lib {
         let _ = addr.send(3).await;
         let _ = addr.start().await;
 
-        tokio::timer::delay(Instant::now() + Duration::from_secs(2)).await;
+        delay_for(Duration::from_secs(2)).await;
 
         Ok(())
     }
