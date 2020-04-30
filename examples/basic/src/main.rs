@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use heng_rs::{Scheduler, SendError, Time, ToDuration};
-use tokio::timer::delay;
+use tokio::time::delay_for;
 
 // setup a new schedule
 struct TestSchedule;
@@ -40,7 +40,7 @@ async fn main() -> std::io::Result<()> {
 
                     // if we take too long to finish.the scheduler will wait until the task at hand finish.
                     if msg == 32 {
-                        delay(Instant::now() + Duration::from_secs(1)).await;
+                        delay_for(Duration::from_secs(1)).await;
                     }
                 } else {
                     /* or something without message */
@@ -58,7 +58,7 @@ async fn main() -> std::io::Result<()> {
     // signal the scheduler and temporary stop it.
     let _ = addr.stop().await;
 
-    delay(Instant::now() + Duration::from_secs(2)).await;
+    delay_for(Duration::from_secs(2)).await;
 
     // restart the scheduler.
     let _ = addr.start().await;
@@ -67,7 +67,7 @@ async fn main() -> std::io::Result<()> {
     let time = Time::new().every(500.millis());
     let _ = addr.change_time(time).await;
 
-    delay(Instant::now() + Duration::from_secs(2)).await;
+    delay_for(Duration::from_secs(2)).await;
 
     Ok(())
 }
