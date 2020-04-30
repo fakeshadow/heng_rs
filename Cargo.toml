@@ -23,6 +23,7 @@ members = [
 default = ["with-tokio"]
 with-tokio = ["tokio/time", "tokio/rt-threaded"]
 with-async-std = ["async-std/unstable"]
+with-smol = ["smol"]
 
 [dependencies.async-std]
 version = "1.5.0"
@@ -40,6 +41,10 @@ default-features = false
 [dependencies.tokio]
 version = "0.2.16"
 default-features = false
+optional = true
+
+[dependencies.smol]
+version = "0.1.4"
 optional = true
 
 [dev-dependencies]

@@ -30,9 +30,7 @@
 //!         task.0 += 1;
 //!
 //!         // run a future.
-//!         async {
-//!             Ok::<(),()>(())
-//!         }
+//!         async {}
 //!     });
 //!
 //!     // use address to push message to task's context;
@@ -143,7 +141,7 @@ impl<M, Fut> SpawnSend<Fut> for SchedulerSender<M>
 where
     M: Send + 'static,
     Fut: Future + Send + 'static,
-    Fut::Output : Send + 'static,
+    Fut::Output: Send + 'static,
 {
     fn spawn_send(fut: Fut) {
         tokio::spawn(fut);
@@ -155,10 +153,22 @@ impl<M, Fut> SpawnSend<Fut> for SchedulerSender<M>
 where
     M: Send + 'static,
     Fut: Future + Send + 'static,
-    Fut::Output : Send + 'static,
+    Fut::Output: Send + 'static,
 {
     fn spawn_send(fut: Fut) {
         async_std::task::spawn(fut);
+    }
+}
+
+#[cfg(feature = "with-smol")]
+impl<M, Fut> SpawnSend<Fut> for SchedulerSender<M>
+where
+    M: Send + 'static,
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn spawn_send(fut: Fut) {
+        let _ = smol::Task::spawn(fut);
     }
 }
 
@@ -179,6 +189,14 @@ pub trait Scheduler: Sized + Send + 'static {
         Fut: Future<Output = ()> + Send + 'static,
     {
         async_std::task::spawn(fut);
+    }
+
+    #[cfg(feature = "with-smol")]
+    fn spawn<Fut>(fut: Fut)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let _ = smol::Task::spawn(fut);
     }
 
     #[cfg(feature = "with-tokio")]
@@ -204,23 +222,46 @@ pub trait Scheduler: Sized + Send + 'static {
         Box::pin(async_std::future::timeout(dur, fut))
     }
 
+    #[cfg(feature = "with-smol")]
+    fn timeout<'fu, Fut, Res>(
+        dur: Duration,
+        fut: Fut,
+    ) -> Pin<Box<dyn Future<Output = Result<Res, std::io::Error>> + Send + 'fu>>
+    where
+        Fut: Future<Output = Res> + Send + 'fu,
+        Res: 'fu,
+    {
+        Box::pin(async move {
+            futures_util::pin_mut!(fut);
+            match futures_util::future::select(fut, smol::Timer::after(dur)).await {
+                futures_util::future::Either::Left((out, _)) => Ok(out),
+                futures_util::future::Either::Right(_) => Err(std::io::ErrorKind::TimedOut.into()),
+            }
+        })
+    }
+
     #[cfg(feature = "with-tokio")]
     fn interval(dur: Duration) -> tokio::time::Interval {
         tokio::time::interval(dur)
     }
 
-    #[cfg(feature = "async-std")]
+    #[cfg(feature = "with-async-std")]
     fn interval(dur: Duration) -> async_std::stream::Interval {
         async_std::stream::interval(dur)
+    }
+
+    #[cfg(feature = "with-smol")]
+    fn interval(dur: Duration) -> SmolInterval {
+        SmolInterval { dur }
     }
 
     /// start a new `Scheduler` with the given time and closure.
     ///
     /// You can't get access of `&mut Self` and `&mut Context` in the closure within async block.
-    fn start<F, Fut, R>(self, time: impl Into<Duration>, f: F) -> SchedulerSender<Self::Message>
+    fn start<F, Fut>(self, time: impl Into<Duration>, f: F) -> SchedulerSender<Self::Message>
     where
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         // setup context.
         let (mut ctx, tx_sig) = Context::new();
@@ -238,10 +279,10 @@ pub trait Scheduler: Sized + Send + 'static {
         SchedulerSender { tx, tx_sig }
     }
 
-    fn run<F, Fut, R>(mut self, mut f: F, mut ctx: Context<Self>)
+    fn run<F, Fut>(mut self, mut f: F, mut ctx: Context<Self>)
     where
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
-        Fut: Future<Output = R> + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         Self::spawn(async move {
             let dur = ctx.dur;
@@ -372,7 +413,7 @@ pub trait Scheduler: Sized + Send + 'static {
                     }
                 }
             }
-        });
+        })
     }
 
     fn spawn_message_channel<S: Scheduler>(
@@ -421,6 +462,18 @@ impl IntervalTick<'_, tokio::time::Instant> for tokio::time::Interval {
 impl IntervalTick<'_, Option<()>> for async_std::stream::Interval {
     fn interval_tick(&mut self) -> Pin<Box<dyn Future<Output = Option<()>> + Send + '_>> {
         Box::pin(self.next())
+    }
+}
+
+#[cfg(feature = "with-smol")]
+pub struct SmolInterval {
+    dur: Duration,
+}
+
+#[cfg(feature = "with-smol")]
+impl IntervalTick<'_, std::time::Instant> for SmolInterval {
+    fn interval_tick(&mut self) -> Pin<Box<dyn Future<Output = std::time::Instant> + Send + '_>> {
+        Box::pin(smol::Timer::after(self.dur))
     }
 }
 
