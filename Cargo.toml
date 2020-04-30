@@ -19,6 +19,15 @@ members = [
   "examples/basic",
 ]
 
+[features]
+default = ["with-tokio"]
+with-tokio = ["tokio/time", "tokio/rt-threaded"]
+with-async-std = ["async-std/unstable"]
+
+[dependencies.async-std]
+version = "1.5.0"
+optional = true
+
 [dependencies.futures-channel]
 version = "0.3.4"
 features = ["sink"]
@@ -31,7 +40,7 @@ default-features = false
 [dependencies.tokio]
 version = "0.2.16"
 default-features = false
-features = [ "rt-core", "time" ]
+optional = true
 
 [dev-dependencies]
 tokio = { version = "0.2.16", default-features = false, features = [ "macros" ] }

@@ -1,4 +1,4 @@
-//! A simple schedule task runner on tokio runtime that support one way message pushing.
+//! A simple schedule task runner on tokio or async_std runtime that support one way message pushing.
 //!
 //! # example:
 //! ```rust
@@ -20,12 +20,13 @@
 //!         .plus(3.m())
 //!         .plus(4.s());
 //!     // run task with a 1 day, 2 hours, 3 minutes and 4 seconds interval.
+//!
 //!     let addr = task.start(time, |task, ctx| {
 //!         if let Some(msg) = ctx.get_msg_front() {
 //!             /* do something with message */
 //!         }
 //!
-//!         // do something with task.
+//!         // we can mutate task's state.
 //!         task.0 += 1;
 //!
 //!         // run a future.
@@ -36,9 +37,17 @@
 //!
 //!     // use address to push message to task's context;
 //!     addr.send(1).await;
+//!
+//!     // when address is dropped the task is removed from runtime.
+//!     drop(addr);
+//!
 //!     Ok(())
 //! }
 //! ```
+
+// re export futures channel's SendError
+pub use futures_channel::mpsc::SendError;
+pub use time::{Time, ToDuration};
 
 use std::any::TypeId;
 use std::collections::VecDeque;
@@ -50,20 +59,14 @@ use std::time::Duration;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::{SinkExt, StreamExt};
 
-// re export futures channel's SendError
-pub use futures_channel::mpsc::SendError;
-use tokio::time::{interval, timeout};
-
-pub use time::{Time, ToDuration};
-
 mod time;
 
-pub struct SchedulerSender<M> {
+pub struct SchedulerSender<M: Send + 'static> {
     tx: Option<UnboundedSender<M>>,
     tx_sig: Option<UnboundedSender<Signal>>,
 }
 
-impl<M> Clone for SchedulerSender<M> {
+impl<M: Send + 'static> Clone for SchedulerSender<M> {
     fn clone(&self) -> Self {
         SchedulerSender {
             tx: self.tx.as_ref().cloned(),
@@ -72,8 +75,19 @@ impl<M> Clone for SchedulerSender<M> {
     }
 }
 
+// When scheduler sender is dropped we inform `impl Scheduler` it's time to remove itself from runtime.
+impl<M: Send + 'static> Drop for SchedulerSender<M> {
+    fn drop(&mut self) {
+        if let Some(mut sender) = self.tx_sig.clone() {
+            Self::spawn_send(async move {
+                let _ = sender.send(Signal::Close).await;
+            });
+        }
+    }
+}
+
 impl<M: Send + 'static> SchedulerSender<M> {
-    /// send message to `Scheduler`'s `Context`.
+    /// send message to `Scheduler`'s `Context` and return a `futures_channel::mpsc::SendError` if it's failed
     ///
     /// `Context` stores the message in a `VecDequeue`.New message is pushed to the back.
     pub async fn send(&self, msg: M) -> Result<(), SendError> {
@@ -85,9 +99,11 @@ impl<M: Send + 'static> SchedulerSender<M> {
     }
 
     /// send message to `Scheduler`'s `Context` and ignore the result.
+    ///
+    /// If the executor is full/closed the message will be lost.
     pub fn do_send(&self, msg: M) {
         let sender = self.clone();
-        tokio::spawn(async move {
+        Self::spawn_send(async move {
             let _ = sender.tx.as_ref().unwrap().send(msg).await;
         });
     }
@@ -117,12 +133,90 @@ impl<M: Send + 'static> SchedulerSender<M> {
     }
 }
 
+/// impl this trait for SchedulerSender can make it spawn a future on different runtime and send message while ignoring the return.
+pub trait SpawnSend<Fut> {
+    fn spawn_send(fut: Fut);
+}
+
+#[cfg(feature = "with-tokio")]
+impl<M, Fut> SpawnSend<Fut> for SchedulerSender<M>
+where
+    M: Send + 'static,
+    Fut: Future + Send + 'static,
+    Fut::Output : Send + 'static,
+{
+    fn spawn_send(fut: Fut) {
+        tokio::spawn(fut);
+    }
+}
+
+#[cfg(feature = "with-async-std")]
+impl<M, Fut> SpawnSend<Fut> for SchedulerSender<M>
+where
+    M: Send + 'static,
+    Fut: Future + Send + 'static,
+    Fut::Output : Send + 'static,
+{
+    fn spawn_send(fut: Fut) {
+        async_std::task::spawn(fut);
+    }
+}
+
 pub trait Scheduler: Sized + Send + 'static {
     type Message: Send;
 
+    #[cfg(feature = "with-tokio")]
+    fn spawn<Fut>(fut: Fut)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(fut);
+    }
+
+    #[cfg(feature = "with-async-std")]
+    fn spawn<Fut>(fut: Fut)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        async_std::task::spawn(fut);
+    }
+
+    #[cfg(feature = "with-tokio")]
+    fn timeout<'fu, Fut, Res>(
+        dur: Duration,
+        fut: Fut,
+    ) -> Pin<Box<dyn Future<Output = Result<Res, tokio::time::Elapsed>> + Send + 'fu>>
+    where
+        Fut: Future<Output = Res> + Send + 'fu,
+    {
+        Box::pin(tokio::time::timeout(dur, fut))
+    }
+
+    #[cfg(feature = "with-async-std")]
+    fn timeout<'fu, Fut, Res>(
+        dur: Duration,
+        fut: Fut,
+    ) -> Pin<Box<dyn Future<Output = Result<Res, async_std::future::TimeoutError>> + Send + 'fu>>
+    where
+        Fut: Future<Output = Res> + Send + 'fu,
+        Res: 'fu,
+    {
+        Box::pin(async_std::future::timeout(dur, fut))
+    }
+
+    #[cfg(feature = "with-tokio")]
+    fn interval(dur: Duration) -> tokio::time::Interval {
+        tokio::time::interval(dur)
+    }
+
+    #[cfg(feature = "async-std")]
+    fn interval(dur: Duration) -> async_std::stream::Interval {
+        async_std::stream::interval(dur)
+    }
+
     /// start a new `Scheduler` with the given time and closure.
     ///
-    /// You can't get access of `&mut Self` and `&mut Context` in the closure with a future or async block.
+    /// You can't get access of `&mut Self` and `&mut Context` in the closure within async block.
     fn start<F, Fut, R>(self, time: impl Into<Duration>, f: F) -> SchedulerSender<Self::Message>
     where
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
@@ -132,10 +226,10 @@ pub trait Scheduler: Sized + Send + 'static {
         let (mut ctx, tx_sig) = Context::new();
 
         // setup message channel.
-        let tx = spawn_message_channel::<Self>(&ctx.msg);
+        let tx = Self::spawn_message_channel::<Self>(&ctx.msg);
 
         // set duration.
-        ctx.signal(Signal::ChangeDur(time.into()));
+        ctx.signal_to_state(Signal::ChangeDur(time.into()));
 
         // run the interval.
         self.run(f, ctx);
@@ -149,22 +243,41 @@ pub trait Scheduler: Sized + Send + 'static {
         F: FnMut(&mut Self, &mut Context<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
     {
-        tokio::spawn(async move {
+        Self::spawn(async move {
             let dur = ctx.dur;
-            let mut interval = interval(dur);
+            let mut interval = Self::interval(dur);
             loop {
-                interval.tick().await;
-                // if we are not running we just ignore F.
-                if ctx.running {
-                    f(&mut self, &mut ctx).await;
+                interval.interval_tick().await;
+
+                match ctx.state {
+                    State::Closed => break,
+                    State::Running => {
+                        f(&mut self, &mut ctx).await;
+                    }
+                    // if we are not running we just ignore handler.
+                    State::Stopped => {}
                 }
 
-                if ctx.should_restart(dur).await {
-                    break;
+                // we listen to signal for a period of self duration after handler
+                let next = Self::timeout(dur, ctx.rx_sig.next()).await;
+                if let Ok(signal) = next {
+                    if let Some(signal) = signal {
+                        match signal {
+                            Signal::Stop => ctx.state = State::Stopped,
+                            Signal::Start => ctx.state = State::Running,
+                            Signal::Close => {
+                                ctx.state = State::Closed;
+                                break;
+                            }
+                            Signal::ChangeDur(dur) => {
+                                ctx.dur = dur;
+                                drop(interval);
+                                break self.run(f, ctx);
+                            }
+                        };
+                    }
                 }
             }
-            drop(interval);
-            return self.run(f, ctx);
         });
     }
 
@@ -175,7 +288,7 @@ pub trait Scheduler: Sized + Send + 'static {
         Box::pin(async {})
     }
 
-    /// You can access `&mut Self` and `&mut Context<Self>` in a future if you manually impl `handler` method for your Type
+    /// You can access `&mut Self` and `&mut Context<Self>` in an async block if you manually impl `handler` method for your Type
     /// and start the task with `start_with_handler`
     ///```rust
     /// use std::pin::Pin;
@@ -202,6 +315,7 @@ pub trait Scheduler: Sized + Send + 'static {
     ///         })
     ///     }
     /// }
+    ///
     /// #[tokio::main]
     /// async fn main() -> std::io::Result<()> {
     ///     let task = TestTask { field: 0 };
@@ -216,9 +330,9 @@ pub trait Scheduler: Sized + Send + 'static {
     fn start_with_handler(self, time: impl Into<Duration>) -> SchedulerSender<Self::Message> {
         let (mut ctx, tx_sig) = Context::new();
 
-        let tx = spawn_message_channel::<Self>(&ctx.msg);
+        let tx = Self::spawn_message_channel::<Self>(&ctx.msg);
 
-        ctx.signal(Signal::ChangeDur(time.into()));
+        ctx.signal_to_state(Signal::ChangeDur(time.into()));
 
         self.run_with_handler(ctx);
 
@@ -226,66 +340,107 @@ pub trait Scheduler: Sized + Send + 'static {
     }
 
     fn run_with_handler(mut self, mut ctx: Context<Self>) {
-        tokio::spawn(async move {
+        Self::spawn(async move {
             let dur = ctx.dur;
-            let mut interval = interval(dur);
+            let mut interval = Self::interval(dur);
             loop {
-                interval.tick().await;
-                // if we are not running we just ignore handler.
-                if ctx.running {
-                    self.handler(&mut ctx).await;
+                interval.interval_tick().await;
+
+                match ctx.state {
+                    State::Closed => break,
+                    State::Running => self.handler(&mut ctx).await,
+                    // if we are not running we just ignore handler.
+                    State::Stopped => {}
                 }
 
-                // we listen to signal for a period of self duration after handler
-                if ctx.should_restart(dur).await {
-                    break;
+                let next = Self::timeout(dur, ctx.rx_sig.next()).await;
+                if let Ok(signal) = next {
+                    if let Some(signal) = signal {
+                        match signal {
+                            Signal::Stop => ctx.state = State::Stopped,
+                            Signal::Start => ctx.state = State::Running,
+                            Signal::Close => {
+                                ctx.state = State::Closed;
+                                break;
+                            }
+                            Signal::ChangeDur(dur) => {
+                                ctx.dur = dur;
+                                drop(interval);
+                                break self.run_with_handler(ctx);
+                            }
+                        };
+                    }
                 }
             }
-            drop(interval);
-            return self.run_with_handler(ctx);
         });
+    }
+
+    fn spawn_message_channel<S: Scheduler>(
+        msg: &Arc<Mutex<VecDeque<S::Message>>>,
+    ) -> Option<UnboundedSender<S::Message>> {
+        // If we have a message type other than ().
+        // Then we pass message queue and message channel to spawn future and push new message to it.
+        if TypeId::of::<S::Message>() == TypeId::of::<()>() {
+            None
+        } else {
+            // setup message channel.
+            let (tx, mut rx) = unbounded::<S::Message>();
+
+            // spawn a future to inject message to context.msg with channel sender.
+            let msg = Arc::downgrade(&msg);
+            Self::spawn(async move {
+                // this future should dropped automatically when the Unbounded sender is dropped.
+                while let Some(m) = rx.next().await {
+                    match msg.upgrade() {
+                        Some(msg) => msg
+                            .lock()
+                            .expect("Failed to acquire Message Mutex lock")
+                            .push_back(m),
+                        None => break,
+                    };
+                }
+            });
+
+            Some(tx)
+        }
     }
 }
 
-fn spawn_message_channel<S: Scheduler>(
-    msg: &Arc<Mutex<VecDeque<S::Message>>>,
-) -> Option<UnboundedSender<S::Message>> {
-    // If we have a message type other than ().
-    // Then we pass message queue and message channel to spawn future and push new message to it.
-    if TypeId::of::<S::Message>() == TypeId::of::<()>() {
-        None
-    } else {
-        // setup message channel.
-        let (tx, mut rx) = unbounded::<S::Message>();
+trait IntervalTick<'se, Instant> {
+    fn interval_tick(&'se mut self) -> Pin<Box<dyn Future<Output = Instant> + Send + 'se>>;
+}
 
-        // spawn a future to inject message to context.msg with channel sender.
-        let msg = Arc::downgrade(&msg);
-        tokio::spawn(async move {
-            while let Some(m) = rx.next().await {
-                match msg.upgrade() {
-                    Some(msg) => msg
-                        .lock()
-                        .expect("Failed to acquire Message Mutex lock")
-                        .push_back(m),
-                    None => panic!("Fail to upgrade Arc<Mutex<VecDequeue<Scheduler::Message>"),
-                };
-            }
-        });
+#[cfg(feature = "with-tokio")]
+impl IntervalTick<'_, tokio::time::Instant> for tokio::time::Interval {
+    fn interval_tick(&mut self) -> Pin<Box<dyn Future<Output = tokio::time::Instant> + Send + '_>> {
+        Box::pin(self.tick())
+    }
+}
 
-        Some(tx)
+#[cfg(feature = "with-async-std")]
+impl IntervalTick<'_, Option<()>> for async_std::stream::Interval {
+    fn interval_tick(&mut self) -> Pin<Box<dyn Future<Output = Option<()>> + Send + '_>> {
+        Box::pin(self.next())
     }
 }
 
 enum Signal {
     Stop,
     Start,
+    Close,
     ChangeDur(Duration),
+}
+
+enum State {
+    Running,
+    Stopped,
+    Closed,
 }
 
 pub struct Context<S: Scheduler> {
     msg: Arc<Mutex<VecDeque<S::Message>>>,
     dur: Duration,
-    running: bool,
+    state: State,
     rx_sig: UnboundedReceiver<Signal>,
 }
 
@@ -295,20 +450,20 @@ impl<S: Scheduler> Context<S> {
         let ctx = Context {
             msg: Arc::new(Mutex::new(VecDeque::new())),
             dur: Duration::default(),
-            running: true,
+            state: State::Running,
             rx_sig,
         };
 
         (ctx, Some(tx))
     }
 
-    fn signal(&mut self, signal: Signal) -> &mut Self {
+    fn signal_to_state(&mut self, signal: Signal) {
         match signal {
-            Signal::Stop => self.running = false,
-            Signal::Start => self.running = true,
+            Signal::Stop => self.state = State::Stopped,
+            Signal::Start => self.state = State::Running,
+            Signal::Close => self.state = State::Closed,
             Signal::ChangeDur(dur) => self.dur = dur,
         };
-        self
     }
 
     fn lock(&self) -> MutexGuard<'_, VecDeque<S::Message>> {
@@ -340,19 +495,6 @@ impl<S: Scheduler> Context<S> {
 
     pub fn push_msg_front(&self, msg: S::Message) {
         self.lock().push_front(msg)
-    }
-
-    async fn should_restart(&mut self, dur: Duration) -> bool {
-        // we listen to signal for a period of self duration after handle
-        if let Ok(signal) = timeout(dur, self.rx_sig.next()).await {
-            if let Some(signal) = signal {
-                // if we have a changed duration we drop the interval and start a new run.
-                if self.signal(signal).dur != dur {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 
